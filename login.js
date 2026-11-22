@@ -1,38 +1,73 @@
 #!/usr/bin/env node
-// 命令行登录：不依赖 Capy 桌面客户端
+// 登录只有一条路：打开浏览器 → 你在 capy.ai 上自己登录 → 我们把登录 cookie 接过来。
+// 不再自己实现邮箱验证码，也不限定登录方式：微软、谷歌、邮箱码，网页上怎么登都行。
 //
-//   node login.js start you@example.com   发验证码到邮箱
-//   node login.js verify 123456           校验验证码，保存会话
-//   node login.js enroll                  注册本机为执行设备（拿设备令牌）
-//   node login.js status                  看当前登录与设备状态
-//   node login.js logout                  清掉本地会话
-import readline from 'node:readline/promises';
-import { stdin, stdout } from 'node:process';
-import { spawn } from 'node:child_process';
+//   node login.js                 打开浏览器登录（默认）
+//   node login.js browser        同上；加 --fresh 先清掉旧的浏览器配置
+//   node login.js cookie "<串>"  把浏览器 DevTools 里复制的 cookie 粘进来
+//   node login.js attach [端口]  从已经开着调试端口的浏览器里读（默认 9444）
+//   node login.js status         看登录与设备状态
+//   node login.js logout         清掉本地登录态
+//   node login.js adopt          接管桌面客户端的设备身份
+//   node login.js enroll         注册一台新设备
 import fs from 'node:fs';
 import path from 'node:path';
-import { startLogin, finishLogin, enrollDevice, adoptDevice, whoAmI, loadAuth, loadDevice, clearAuth, getJwt, saveAuth, authFile, deviceFile, DATA_DIR } from './lib/auth.js';
+import { spawn } from 'node:child_process';
+import {
+  DATA_DIR,
+  loginWithCookies,
+  parseCookieString,
+  enrollDevice,
+  adoptDevice,
+  loadAuth,
+  loadDevice,
+  clearAuth,
+  getJwt,
+  authFile,
+  deviceFile,
+} from './lib/auth.js';
 
 const [, , cmd, ...rest] = process.argv;
 
-// ---------- 半自动登录：借浏览器完成 SSO，把 Clerk 会话接过来 ----------
+const LOGIN_URL = process.env.CAPY_LOGIN_URL || 'https://capy.ai';
+const PROFILE = path.join(DATA_DIR, 'browser-profile');
+const DEFAULT_PORT = Number(process.env.CAPY_DEBUG_PORT) || 9444;
+const WAIT_MS = Number(process.env.CAPY_LOGIN_TIMEOUT) || 5 * 60 * 1000;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------- 找浏览器 ----------
 const BROWSER_CANDIDATES = [
+  process.env.CAPY_BROWSER,
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
   'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
-];
+  path.join(process.env.LOCALAPPDATA || '', 'Google/Chrome/Application/chrome.exe'),
+].filter(Boolean);
 
 function findBrowser() {
-  for (const p of BROWSER_CANDIDATES) if (fs.existsSync(p)) return p;
+  for (const p of BROWSER_CANDIDATES) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {}
+  }
   return null;
 }
 
+// ---------- 极简 CDP：一问一答 ----------
 async function cdp(wsUrl, method, params = {}) {
   const ws = new WebSocket(wsUrl);
   await new Promise((res, rej) => {
-    ws.onopen = res;
-    ws.onerror = () => rej(new Error('连不上浏览器调试端口'));
+    const t = setTimeout(() => rej(new Error('连浏览器调试端口超时')), 8000);
+    ws.onopen = () => {
+      clearTimeout(t);
+      res();
+    };
+    ws.onerror = () => {
+      clearTimeout(t);
+      rej(new Error('连不上浏览器调试端口'));
+    };
   });
   try {
     return await new Promise((resolve, reject) => {
@@ -56,24 +91,32 @@ async function cdp(wsUrl, method, params = {}) {
 
 // Network.getAllCookies 只能挂在具体页面会话上，浏览器级别的 ws 调不到
 async function pageTarget(port) {
-  const list = await fetch(`http://127.0.0.1:${port}/json/list`).then((r) => r.json());
+  const list = await fetch(`http://127.0.0.1:${port}/json/list`, {
+    signal: AbortSignal.timeout(4000),
+  }).then((r) => r.json());
   const pages = (list || []).filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
-  const hit = pages.find((t) => /(^|\.)capy\.ai$/.test(new URL(t.url).hostname));
+  const hit = pages.find((t) => {
+    try {
+      return /(^|\.)capy\.ai$/.test(new URL(t.url).hostname);
+    } catch {
+      return false;
+    }
+  });
   return hit || pages[0] || null;
 }
 
-async function readClerkCookie(port) {
+// 从浏览器里把 Clerk 的 cookie 捞出来
+async function readCookies(port) {
   const page = await pageTarget(port);
   if (!page) return null;
   const all = await cdp(page.webSocketDebuggerUrl, 'Network.getAllCookies');
   const cookies = all?.cookies || [];
-  const client = cookies.find((c) => c.name === '__client' && /clerk\.capy\.ai$/.test(c.domain) && c.value);
+  const client = cookies.find((c) => c.name === '__client' && /(^|\.)clerk\.capy\.ai$/.test(c.domain) && c.value);
   if (!client) return null;
   const uat = cookies.find((c) => c.name === '__client_uat' && /(^|\.)capy\.ai$/.test(c.domain) && c.value);
-  return { client: client.value, uat: uat?.value || null, page };
+  return { client: client.value, uat: uat?.value || null };
 }
 
-// 让浏览器自己退出，避免它在后台继续轮换 cookie
 async function closeBrowser(port) {
   try {
     const page = await pageTarget(port);
@@ -81,156 +124,173 @@ async function closeBrowser(port) {
   } catch {}
 }
 
-async function waitClerkCookie(port, timeoutMs = 300000) {
-  const started = Date.now();
-  let lastNote = 0;
-  while (Date.now() - started < timeoutMs) {
+// 让浏览器自己退出，避免它在后台继续轮换 cookie
+async function shutdown(child, port) {
+  await closeBrowser(port);
+  try {
+    child?.kill();
+  } catch {}
+}
+
+// 实际调试端口可能不是我们要的那个（端口被占时浏览器会换一个），以 DevToolsActivePort 为准
+async function activePort(fallback, tries = 20) {
+  const file = path.join(PROFILE, 'DevToolsActivePort');
+  for (let i = 0; i < tries; i++) {
     try {
-      const got = await readClerkCookie(port);
-      if (got) return got;
-      if (Date.now() - lastNote > 10000) {
-        lastNote = Date.now();
-        const left = Math.round((timeoutMs - (Date.now() - started)) / 1000);
-        process.stdout.write(`\r等待登录… 剩余 ${left}s   `);
-      }
+      const first = fs.readFileSync(file, 'utf8').split(/\r?\n/)[0].trim();
+      if (/^\d+$/.test(first)) return Number(first);
     } catch {}
-    await new Promise((r) => setTimeout(r, 1200));
+    await sleep(250);
   }
-  const err = new Error('等待登录超时（5 分钟）');
-  err.code = 'login_timeout';
-  throw err;
+  return fallback;
 }
 
-// 用浏览器里的 __client cookie 换 Clerk 会话 → JWT → 落盘
-async function completeFromCookie(got) {
-  const authMod = await import('./lib/auth.js');
-  const jar = { __client: got.client };
-  if (got.uat) jar.__client_uat = got.uat;
-
-  const clientRes = await authMod.clerkGet(jar, '/v1/client');
-  const client = clientRes?.response || clientRes;
-  const sessions = client?.sessions || [];
-  const active = sessions.find((s) => s.status === 'active') || sessions[0];
-  if (!active?.id) {
-    throw new Error('浏览器已登录，但没拿到有效会话。请重试，或在窗口里确认已进入 Capy 主界面。');
-  }
-
-  const tok = await authMod.clerkPost(jar, `/v1/client/sessions/${active.id}/tokens`);
-  const jwt = tok?.jwt;
-  if (!jwt) throw new Error('会话有效但换不到 token');
-
-  const claims = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString('utf8'));
-  const email =
-    active?.user?.primary_email_address?.email_address ||
-    active?.user?.email_addresses?.[0]?.email_address ||
-    null;
-  saveAuth({
-    email,
-    jar,
-    sessionId: active.id,
-    userId: claims.sub || null,
-    jwt,
-    jwtExp: claims.exp || null,
-    via: 'browser-sso',
-  });
-
-  console.log('✓ 登录成功:', email || claims.sub);
-  const me = await whoAmI().catch(() => null);
-  if (me?.orgId) {
-    saveAuth({ orgId: me.orgId });
-    console.log('  组织 ID:', me.orgId);
-  }
-  if (loadDevice()?.deviceId) {
-    console.log('  设备已绑定:', loadDevice().deviceId);
-  } else {
-    console.log('  ⚠ 还没有设备身份：运行 node login.js adopt');
-  }
-  console.log('');
-  console.log('现在可以启动： .\\start.bat');
-}
-
-function launchBrowser(port, profile) {
+function launchBrowser(port) {
   const exe = findBrowser();
-  if (!exe) throw new Error('没有找到 Edge / Chrome，请先安装其中一个');
-  fs.mkdirSync(profile, { recursive: true });
-  console.log('打开浏览器窗口（独立配置，不影响你平时的浏览器）…');
+  if (!exe) {
+    throw new Error('没有找到 Edge / Chrome。装一个就行，或用 CAPY_BROWSER 指定浏览器路径');
+  }
+  fs.mkdirSync(PROFILE, { recursive: true });
+  // 上一次留下的端口文件会骗到我们，先删掉
+  try {
+    fs.rmSync(path.join(PROFILE, 'DevToolsActivePort'), { force: true });
+  } catch {}
   return spawn(
     exe,
     [
       `--remote-debugging-port=${port}`,
-      `--user-data-dir=${profile}`,
+      `--user-data-dir=${PROFILE}`,
       '--no-first-run',
       '--no-default-browser-check',
       '--new-window',
-      'https://capy.ai/sign-in',
+      LOGIN_URL,
     ],
     { stdio: 'ignore' },
   );
 }
 
-async function browserLogin() {
-  const port = 9444;
-  const profile = path.join(DATA_DIR, 'browser-profile');
-  const child = launchBrowser(port, profile);
+async function waitForCookies(port, child) {
+  const started = Date.now();
+  let lastNote = 0;
+  let deadAt = 0;
+  child?.once('exit', () => {
+    deadAt = Date.now();
+  });
 
-  console.log('请在窗口里点「微软登录」并完成登录，完成后这里会自动继续。');
-  const got = await waitClerkCookie(port);
-  process.stdout.write('\r' + ' '.repeat(40) + '\r');
-  console.log('✓ 已捕获登录会话');
-
-  // 先关浏览器再换 token：避免它在后台轮换 cookie，导致手上的失效
-  try {
-    child.kill();
-  } catch {}
-  await closeBrowser(port);
-
-  await completeFromCookie(got);
+  while (Date.now() - started < WAIT_MS) {
+    try {
+      const got = await readCookies(port);
+      if (got) return got;
+    } catch {}
+    // 窗口被关掉就尽快失败；但如果只是这个配置目录被另一个窗口占着，
+    // 那个窗口仍然可能持有登录态，所以再多等 3 秒
+    if (deadAt && Date.now() - deadAt > 3000) {
+      throw new Error('浏览器窗口被关掉了，登录没有完成（也可能这个配置目录已被另一个窗口占用）');
+    }
+    if (Date.now() - lastNote > 5000) {
+      lastNote = Date.now();
+      const left = Math.round((WAIT_MS - (Date.now() - started)) / 1000);
+      if (process.stdout.isTTY) process.stdout.write(`\r  等待登录… 剩余 ${left}s   `);
+    }
+    await sleep(1200);
+  }
+  const err = new Error(`等待登录超时（${Math.round(WAIT_MS / 1000)} 秒）`);
+  err.code = 'login_timeout';
+  throw err;
 }
 
-// 复用已经开着（且已登录）的调试浏览器
-async function fromBrowser(portArg) {
-  const port = Number(portArg) || 9444;
+// ---------- 拿到 cookie 之后：换会话、落盘、报状态 ----------
+async function finish(cookies, via) {
+  const r = await loginWithCookies(cookies, { via });
+  console.log('✓ 登录成功：' + (r.email || r.userId || '（未知账号）'));
+  if (r.orgId) console.log('  组织 ID：' + r.orgId);
+
+  const dev = loadDevice();
+  if (dev?.deviceId) {
+    console.log('  执行设备：' + String(dev.deviceId).slice(0, 26) + '…（本机）');
+  } else {
+    console.log('');
+    console.log('  还没有执行设备身份，接着运行： node login.js adopt');
+  }
+
+  console.log('');
+  console.log('下一步： .\\start.bat');
+  return 0;
+}
+
+// ---------- 方式一：开浏览器，你自己登 ----------
+async function browserLogin({ fresh = false } = {}) {
+  if (fresh) {
+    try {
+      fs.rmSync(PROFILE, { recursive: true, force: true });
+      console.log('已清掉旧的浏览器配置：' + PROFILE);
+    } catch (e) {
+      console.log('清配置失败（不影响继续）：' + e.message);
+    }
+  }
+
+  const child = launchBrowser(DEFAULT_PORT);
+  const port = await activePort(DEFAULT_PORT);
+
+  console.log('');
+  console.log('  打开了一个独立浏览器窗口（不影响你平时用的浏览器）。');
+  console.log('  地址：' + LOGIN_URL);
+  console.log('');
+  console.log('  在里面用你惯用的方式登录就行 —— 微软、谷歌、邮箱验证码都可以，网页让你怎么登就怎么登。');
+  console.log('  登进 Capy 主界面后这里会自动继续，不用回来敲任何东西。');
+  console.log('');
+
   let got;
   try {
-    got = await readClerkCookie(port);
+    got = await waitForCookies(port, child);
+  } catch (e) {
+    await shutdown(child, port);
+    throw e;
+  }
+  process.stdout.write(process.stdout.isTTY ? '\x1b[2K\r' : '');
+  console.log('✓ 已抓到登录 cookie');
+
+  // 先关浏览器再换 token：避免它在后台轮换 cookie，导致手上这份失效
+  await shutdown(child, port);
+  return finish({ __client: got.client, __client_uat: got.uat }, 'browser');
+}
+
+// ---------- 方式二：直接粘 cookie ----------
+async function cookieLogin(raw) {
+  if (!raw) {
+    console.error('用法: node login.js cookie "__client=eyJ...; __client_uat=..."');
+    console.error('');
+    console.error('取法：在已经登录 capy.ai 的浏览器里按 F12 → Application → Cookies');
+    console.error('      → https://clerk.capy.ai 复制 __client，再复制 capy.ai 的 __client_uat');
+    process.exit(2);
+  }
+  // 只粘了一个值（没有 name=）时，当成 __client
+  if (!raw.includes('=')) raw = `__client=${raw}`;
+  const jar = parseCookieString(raw);
+  if (!jar.__client) {
+    console.error('这串里没有 __client，没法换会话。');
+    process.exit(2);
+  }
+  console.log('✓ 已解析 cookie：' + Object.keys(jar).join(', '));
+  return finish(jar, 'cookie');
+}
+
+// ---------- 方式三：接管一个已经开着调试端口的浏览器 ----------
+async function attachLogin(portArg) {
+  const port = Number(portArg) || DEFAULT_PORT;
+  let got;
+  try {
+    got = await readCookies(port);
   } catch (e) {
     throw new Error(`连不上 ${port} 端口的浏览器：${e.message}`);
   }
-  if (!got) throw new Error('这个浏览器里还没有 Capy 登录会话，请先在窗口里完成登录');
-  console.log('✓ 已从浏览器读到登录会话');
+  if (!got) throw new Error('这个浏览器里还没有 Capy 登录态，请先在窗口里登录');
+  console.log('✓ 已从浏览器读到登录 cookie');
   await closeBrowser(port);
-  await completeFromCookie(got);
+  return finish({ __client: got.client, __client_uat: got.uat }, 'attach');
 }
 
-// 一次跑完：输邮箱 → 收码 → 输码 → 自动注册设备
-async function interactive() {
-  const rl = readline.createInterface({ input: stdin, output: stdout });
-  try {
-    const email = (await rl.question('Capy 账号邮箱: ')).trim();
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error('邮箱格式不对');
-    const r = await startLogin(email);
-    console.log(`验证码已发送（${r.status || 'needs_first_factor'}）`);
-    const code = (await rl.question('邮箱收到的 6 位验证码: ')).trim();
-    const auth = await finishLogin(code);
-    console.log('✓ 登录成功:', auth.email || auth.userId);
-    const me = await whoAmI().catch(() => null);
-    if (me?.orgId) {
-      saveAuth({ orgId: me.orgId });
-      console.log('  组织 ID:', me.orgId);
-    }
-    if (loadDevice()?.deviceId) {
-      console.log('✓ 设备已绑定:', loadDevice().deviceId);
-    } else {
-      const dev = await enrollDevice();
-      console.log('✓ 设备已注册:', dev.deviceId, '|', dev.name);
-    }
-    console.log('');
-    console.log('现在可以启动： .\\start.bat   （或 node device-worker.js + node server.js）');
-  } finally {
-    rl.close();
-  }
-}
-
+// ---------- 其他命令 ----------
 function fmt(ts) {
   if (!ts) return '-';
   return new Date(ts).toLocaleString('zh-CN', { hour12: false });
@@ -239,131 +299,114 @@ function fmt(ts) {
 async function status() {
   const auth = loadAuth();
   const dev = loadDevice();
-  console.log('会话文件:', authFile());
+  console.log('会话文件：' + authFile());
   if (!auth) {
-    console.log('登录状态: 未登录（运行 node login.js start <邮箱>）');
+    console.log('登录状态：未登录（运行 node login.js，在浏览器里登录一次）');
   } else {
-    console.log('登录账号:', auth.email || auth.userId);
-    console.log('保存时间:', fmt(auth.updatedAt));
+    console.log('登录账号：' + (auth.email || auth.userId || '（未知）'));
+    console.log('登录方式：' + (auth.via || 'browser'));
+    console.log('保存时间：' + fmt(auth.updatedAt));
     let live = '可用';
     try {
       const jwt = await getJwt({ force: true });
       const claims = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString('utf8'));
       const left = claims.exp ? claims.exp - Math.floor(Date.now() / 1000) : null;
-      live = `可换到新 token（有效期 ${left}s）`;
+      live = `可换到新 token（本次有效期 ${left}s）`;
     } catch (e) {
       live = `不可用：${e.message}`;
     }
-    console.log('会话状态:', live);
+    console.log('会话状态：' + live);
   }
-  console.log('设备文件:', deviceFile());
+  console.log('设备文件：' + deviceFile());
   if (!dev) {
-    console.log('设备状态: 未注册（运行 node login.js enroll）');
+    console.log('设备状态：未注册（运行 node login.js adopt）');
   } else {
-    console.log('设备状态: 已注册');
-    console.log('  设备 ID:', dev.deviceId);
-    console.log('  组织 ID:', dev.orgId);
-    console.log('  设备名  :', dev.name, `(${dev.hostname}, ${dev.os}/${dev.arch})`);
-    console.log('  注册时间:', fmt(dev.enrolledAt));
-    console.log('  令牌    :', `${String(dev.token).slice(0, 10)}…（共 ${String(dev.token).length} 字符）`);
+    console.log('设备状态：已注册');
+    console.log('  设备 ID：' + dev.deviceId);
+    console.log('  组织 ID：' + dev.orgId);
+    console.log('  设备名  ：' + dev.name + `（${dev.hostname}, ${dev.os}/${dev.arch}）`);
+    console.log('  注册时间：' + fmt(dev.enrolledAt));
+    console.log('  令牌    ：' + String(dev.token).slice(0, 10) + `…（共 ${String(dev.token).length} 字符）`);
   }
 }
 
+function help() {
+  console.log('用法: node login.js [命令]');
+  console.log('');
+  console.log('  （不带命令）      打开浏览器登录');
+  console.log('  browser [--fresh] 打开浏览器登录；--fresh 先清掉旧的浏览器配置');
+  console.log('  cookie "<串>"     粘贴 DevTools 里复制的 cookie');
+  console.log('  attach [端口]     从一个已经开着调试端口的浏览器里读（默认 9444）');
+  console.log('  status            看登录与设备状态');
+  console.log('  adopt             接管桌面客户端的设备身份');
+  console.log('  enroll [--name]   注册一台新设备');
+  console.log('  logout            清掉本地登录态（设备信息保留）');
+}
+
 async function main() {
-  if (cmd === 'browser' || cmd === 'sso') {
-    await browserLogin();
-    return;
+  if (!cmd || cmd === 'browser' || cmd === 'login' || cmd === 'go') {
+    return browserLogin({ fresh: rest.includes('--fresh') || rest.includes('-f') });
   }
 
-  if (cmd === 'from-browser') {
-    await fromBrowser(rest[0]);
-    return;
-  }
+  if (cmd === 'cookie') return cookieLogin(rest.join(' ').trim());
 
-  if (cmd === 'login' || cmd === 'go') {
-    await interactive();
-    return;
-  }
-
-  if (cmd === 'start') {
-    const email = rest[0];
-    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-      console.error('用法: node login.js start you@example.com');
-      process.exit(2);
-    }
-    const r = await startLogin(email);
-    console.log(`验证码已发送到 ${r.email}`);
-    console.log(`登录状态: ${r.status || 'needs_first_factor'}｜支持的方式: ${r.supported.join(', ') || 'email_code'}`);
-    console.log('');
-    console.log('收到 6 位验证码后执行： node login.js verify <验证码>');
-    return;
-  }
-
-  if (cmd === 'verify') {
-    const code = rest[0];
-    if (!code) {
-      console.error('用法: node login.js verify 123456');
-      process.exit(2);
-    }
-    const auth = await finishLogin(code);
-    console.log('登录成功:', auth.email || auth.userId);
-    try {
-      const me = await whoAmI();
-      if (me.orgId) {
-        const { saveAuth } = await import('./lib/auth.js');
-        saveAuth({ orgId: me.orgId });
-        console.log('组织 ID:', me.orgId);
-      }
-    } catch (e) {
-      console.log('（读取组织信息失败，稍后可重试）', e.message);
-    }
-    console.log('');
-    console.log('下一步： node login.js enroll   注册本机为执行设备');
-    return;
-  }
-
-  if (cmd === 'enroll') {
-    const nameArg = rest.indexOf('--name');
-    const name = nameArg >= 0 ? rest[nameArg + 1] : null;
-    const dev = await enrollDevice({ name });
-    console.log('设备注册成功');
-    console.log('  设备 ID:', dev.deviceId);
-    console.log('  组织 ID:', dev.orgId);
-    console.log('  设备名  :', dev.name);
-    console.log('');
-    console.log('现在可以启动： node device-worker.js    （设备执行端）');
-    console.log('              node server.js           （OpenAI 兼容端点）');
-    return;
-  }
+  if (cmd === 'attach' || cmd === 'from-browser') return attachLogin(rest[0]);
 
   if (cmd === 'adopt') {
     const dev = await adoptDevice();
     console.log('已接管这台机器的设备身份');
-    console.log('  设备 ID:', dev.deviceId);
-    console.log('  组织 ID:', dev.orgId);
+    console.log('  设备 ID：' + dev.deviceId);
+    console.log('  组织 ID：' + dev.orgId);
     console.log('');
     console.log('之后可以完全关掉桌面客户端，执行设备端： node device-worker.js');
-    return;
+    return 0;
+  }
+
+  if (cmd === 'enroll') {
+    const i = rest.indexOf('--name');
+    const dev = await enrollDevice({ name: i >= 0 ? rest[i + 1] : null });
+    console.log('设备注册成功');
+    console.log('  设备 ID：' + dev.deviceId);
+    console.log('  组织 ID：' + dev.orgId);
+    console.log('  设备名  ：' + dev.name);
+    console.log('');
+    console.log('现在可以启动： node device-worker.js   （设备执行端）');
+    console.log('              node server.js          （OpenAI 兼容端点）');
+    return 0;
   }
 
   if (cmd === 'logout') {
     clearAuth();
-    console.log('已清除本地登录会话（设备注册信息保留）');
-    return;
+    console.log('已清除本地登录态（设备信息保留）');
+    console.log('浏览器配置还在 data/browser-profile；想连它一起清掉： node login.js browser --fresh');
+    return 0;
   }
 
-  if (cmd === 'status' || !cmd) {
+  if (cmd === 'status' || cmd === '-v' || cmd === '--status') {
     await status();
-    return;
+    return 0;
   }
 
-  console.log(`未知命令: ${cmd}`);
-  console.log('可用命令: browser（浏览器 SSO 登录）| login（邮箱验证码，交互式）| start <邮箱> | verify <验证码> | adopt | status | logout');
+  if (cmd === '-h' || cmd === '--help' || cmd === 'help') {
+    help();
+    return 0;
+  }
+
+  console.error(`未知命令：${cmd}`);
+  console.error('');
+  help();
   process.exit(2);
 }
 
-main().catch((err) => {
-  console.error(`错误: ${err.message}`);
-  if (err.code) console.error(`代码: ${err.code}`);
-  process.exit(1);
-});
+main()
+  .then((code) => process.exit(code || 0))
+  .catch((err) => {
+    console.error('');
+    console.error('错误：' + err.message);
+    if (err.code) console.error('代码：' + err.code);
+    if (err.code === 'no_active_session' || err.code === 'no_client_cookie') {
+      console.error('');
+      console.error('多半是浏览器里存着上一次的旧登录。清掉再来： node login.js browser --fresh');
+    }
+    process.exit(1);
+  });

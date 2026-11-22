@@ -77,13 +77,12 @@ async function checkAuth() {
 async function loginMenu() {
   for (;;) {
     say('');
-    say('   请选择登录方式：');
+    say('   请选择：');
     say('');
-    say('     1  微软账号登录   在浏览器窗口里点一下，自动完成（推荐）');
-    say('     2  邮箱验证码登录 输入邮箱，收 6 位验证码');
+    say('     1  打开浏览器登录   窗口里登进 capy.ai，登录完成后自动继续（推荐）');
     say('     0  退出');
     say('');
-    const a = await ask('   输入 1 / 2 / 0 后回车： ');
+    const a = await ask('   输入 1 / 0 后回车： ');
 
     if (a === null) return false; // 输入流关闭，当作退出
     if (a === '') continue; // 空回车，重新显示菜单
@@ -93,19 +92,11 @@ async function loginMenu() {
       say('');
       const code = await runNode(['login.js', 'browser']);
       if (code === 0) return true;
-      bad('微软登录没有完成（窗口被关掉或等待超时），可以再试一次。');
+      bad('登录没有完成（窗口被关掉或等待超时），可以再试一次。');
       continue;
     }
 
-    if (a === '2') {
-      say('');
-      const code = await runNode(['login.js', 'login']);
-      if (code === 0) return true;
-      bad('邮箱登录没有完成，可以再试一次。');
-      continue;
-    }
-
-    warn('请输入 1、2 或 0。');
+    warn('请输入 1 或 0。');
   }
 }
 

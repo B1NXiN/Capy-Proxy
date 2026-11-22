@@ -1,6 +1,6 @@
 {
   "name": "capy-relay",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "description": "把 Capy 账号变成一个标准的 OpenAI 兼容端点，工具调用交给调用方在自己的电脑上执行",
   "main": "server.js",
@@ -38,7 +38,8 @@
     "models": "node tools/extract-models.cjs",
     "test:tunnel": "node tools/test-tunnel.mjs",
     "test:tools": "node tools/test-tools.mjs",
-    "test": "node tools/test-tools.mjs && node tools/test-tunnel.mjs"
+    "test:login": "node tools/test-login.mjs",
+    "test": "node tools/test-tools.mjs && node tools/test-login.mjs && node tools/test-tunnel.mjs"
   },
   "devDependencies": {
     "ws": "^8.23.0"

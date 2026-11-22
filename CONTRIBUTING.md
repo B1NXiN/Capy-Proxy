@@ -16,6 +16,8 @@ npm test             # 工具映射层 + 隧道协议，全部本地，不消耗
 | --- | --- | --- |
 | `lib/oaitools.js` | Capy handler ↔ 标准 function calling 的映射层：名字匹配、参数整形、结果整形、上限 | `npm run test:tools` |
 | `lib/tunnel.js` | 设备 WebSocket 通道：流控窗口、credit、ping、关闭语义 | `npm run test:tunnel` |
+| `lib/auth.js` | cookie 换 JWT、JWT 刷新、设备身份落盘 | `npm run test:login` |
+| `login.js` | 开浏览器 → 读 cookie → 换会话；device 绑定 | `npm run test:login` |
 | `lib/capy.js` | 建线程、读事件、回填工具结果 | — |
 | `lib/clienttools.js` | 挂起调用与配对回填的中枢 | — |
 | `lib/device.js` | 本机执行（bash / 读 / 写 / 编辑 / patch） | — |

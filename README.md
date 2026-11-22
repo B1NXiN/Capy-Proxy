@@ -36,8 +36,8 @@
 | --- | --- |
 | Windows 10 / 11 | 目前只提供 Windows 启动脚本 |
 | Node.js 20 或更高 | 命令行执行 `node -v` 能看到版本号即可 |
-| 一个 Capy 账号 | 支持邮箱验证码，也支持邮箱背后的微软 / 企业 SSO 一键登录 |
-| 一个浏览器 | 选「微软账号登录」时需要，Edge 或 Chrome 均可；用邮箱验证码则不挑 |
+| 一个 Capy 账号 | 普通账号即可，登录在浏览器里完成 |
+| 一个浏览器 | 登录时要用：Edge 或 Chrome，脚本会自动找（找不到可以用 `CAPY_BROWSER` 指定路径） |
 | 一台已绑定为执行端的机器 | 见下面的「第一次启动」；每天使用不需要 Capy 桌面客户端 |
 | Git for Windows | 要让它执行命令就需要。装官方版即可（<https://git-scm.com/download/win>），程序会自动找：先看标准安装目录，再看 `PATH` 里的 git；也可以用环境变量 `CAPY_BASH` 手动指定 bash 路径 |
 
@@ -61,25 +61,27 @@ cd capy-relay
 
 想先改配置：把 `config.example.json` 复制成 `config.json` 再改。不复制也能跑，程序内置了同样的默认值（端口 8787、只监听本机）。
 
-它会先检查账号。还没登录过的话，直接问你要用哪种方式：
+它会先检查账号。没登录过就问一句：
 
 ```
    ---- 账号 ----
    这台机器还没有登录过 Capy 账号。
 
-   请选择登录方式：
+   请选择：
 
-     1  微软账号登录   在浏览器窗口里点一下，自动完成（推荐）
-     2  邮箱验证码登录 输入邮箱，收 6 位验证码
+     1  打开浏览器登录   窗口里登进 capy.ai，登录完成后自动继续（推荐）
      0  退出
 
-   输入 1 / 2 / 0 后回车：
+   输入 1 / 0 后回车：
 ```
 
-- **选 1**：弹出一个独立的浏览器窗口（独立配置，不影响你平时用的浏览器）。在里面点「使用 Microsoft 登录」——微软账号、企业 SSO 都走这个入口。登录成功后窗口会自己关掉，命令行自动继续。
-- **选 2**：就在当前窗口输入 Capy 账号邮箱回车，去邮箱取 6 位验证码，粘回来再回车。
+选 1 之后会发生三件事：
 
-两种方式成功后，同一个脚本接着确认登录态和本机设备身份，然后起服务：
+1. 弹出一个**独立浏览器窗口**，地址是 <https://capy.ai>。这个窗口用的是独立配置（`data/browser-profile`），跟你平时用的浏览器互不干扰，也不读你的历史记录。
+2. 你在里面**正常登录**——微软、谷歌、邮箱验证码，网页给什么入口就用什么。本项目不自己实现登录流程，也不收集密码。
+3. 登进 Capy 主界面后，脚本把浏览器里的登录 cookie（Clerk 的 `__client`）接过来换成本地会话，然后自己把窗口关掉。
+
+成功后，同一个脚本接着确认登录态和本机设备身份，然后起服务：
 
 ```
    [OK] 已登录：you@example.com
@@ -100,15 +102,29 @@ cd capy-relay
 >
 > 登录态保存在 `data/auth.json`，长期有效，过期了下次启动会自动问你要不要重新登录。
 
+### 浏览器窗口打不开，或者想用自己平时那个浏览器
+
+还有两条备用路，都不用重新实现登录：
+
+- **从你自己的浏览器粘 cookie**：在已登录 capy.ai 的浏览器里按 F12 → Application → Cookies，复制 `https://clerk.capy.ai` 下的 `__client`，以及 `capy.ai` 下的 `__client_uat`，然后：
+
+  ```powershell
+  node login.js cookie "__client=eyJ...; __client_uat=1700000000"
+  ```
+
+- **接管一个已经开着调试端口的浏览器**：`node login.js attach 9444`（端口按实际情况改）。
+
+登录态失效（换过密码、在别处登出）时，`node login.js browser --fresh` 会清掉 `data/browser-profile` 重新来一遍。
+
 ---
 
 ## 日常启动
 
-已经登录过就直接双击 `start.bat`，不再问登录方式，直接起服务。
+已经登录过就直接双击 `start.bat`，不再问，直接起服务。
 
-- 想换账号 / 重新登录：`start.bat login`
+- 想换账号 / 重新登录：`start.bat login`（还是会开那个浏览器窗口，登完自动接管）
 - 提示端口被占用：说明上一份还在跑，先关掉那个窗口（连同最小化的 `capy-device`）再来
-- 想跳过菜单、用命令行登录：`node login.js browser`（浏览器）或 `node login.js login`（邮箱码）
+- 想跳过菜单、纯命令行登录：`node login.js`（等于 `node login.js browser`）
 
 想确认状态，浏览器打开 <http://127.0.0.1:8787/health>：
 
@@ -271,10 +287,11 @@ node tools/sim-client.mjs "用 bash 执行 ls /d 看有哪些目录，再用一�
 
 | 命令 | 作用 |
 | --- | --- |
+| `node login.js` | 打开浏览器登录（等同于 `browser`） |
+| `node login.js browser` | 同上；加 `--fresh` 先清掉 `data/browser-profile` 再登 |
+| `node login.js cookie "…"` | 从你自己的浏览器粘 `__client` / `__client_uat` |
+| `node login.js attach [端口]` | 接管一个已开调试端口的浏览器（默认 9444） |
 | `node login.js status` | 看登录是否还有效、设备是谁 |
-| `node login.js browser` | 打开独立浏览器窗口登录（支持微软 / 企业 SSO） |
-| `node login.js from-browser` | 直接接管一个已打开的调试浏览器里的登录会话 |
-| `node login.js login` | 用邮箱验证码登录（不想开窗口时用） |
 | `node login.js adopt` | 重新绑定本机设备身份 |
 | `node login.js logout` | 清除本机登录态（设备绑定保留） |
 | `node device-worker.js` | 单独启动设备执行端 |
@@ -282,7 +299,8 @@ node tools/sim-client.mjs "用 bash 执行 ls /d 看有哪些目录，再用一�
 | `node tools/sim-client.mjs "…"` | 模拟一个客户端跑完整工具闭环（会真的执行命令） |
 | `npm run test:tunnel` | 用假网关跑协议一致性测试（22 项，含窗口/心跳/违规帧） |
 | `npm run test:tools` | 工具映射层单测（44 项：名字匹配、参数形状、结果整形、上限） |
-| `npm test` | 上面两套一起跑 |
+| `npm run test:login` | 登录层单测（13 项：cookie 解析、缺 cookie 的前置拒绝） |
+| `npm test` | 上面三套一起跑 |
 
 ---
 
@@ -309,11 +327,14 @@ node tools/sim-client.mjs "用 bash 执行 ls /d 看有哪些目录，再用一�
 
 | 现象 | 怎么办 |
 | --- | --- |
-| 启动时问「请选择登录方式」 | 正常，还没登录过；选 1 或 2 登录一次即可 |
-| `Not signed in yet` | 先跑 `node login.js browser` 完成登录 |
+| 启动时问「请选择」 | 正常，还没登录过；选 1 登录一次即可 |
+| `Not signed in yet` | 先跑 `node login.js` 完成登录 |
 | `已登录但还没有注册执行设备` | 跑 `node login.js adopt` |
 | `本地登录会话已过期` | 重新跑一次 `start.bat login` |
-| 登录窗口打开后一直显示「等待登录…」 | 确认已经点到「登录成功 / 进入主界面」，不要在登录页关掉窗口 |
+| 登录窗口打开后一直显示「等待登录…」 | 确认已经在网页里登进 Capy 主界面（不是停在登录页），也不要中途关掉窗口 |
+| 提示 `cookie 里的会话已经失效` | 浏览器里存着旧登录；`node login.js browser --fresh` 清掉重登 |
+| 提示 `没有找到 Edge / Chrome` | 装一个，或用环境变量 `CAPY_BROWSER="D:\某处\chrome.exe"` 指定 |
+| 不想开独立窗口 | `node login.js cookie "…"` 从你自己的浏览器粘 cookie |
 | `/health` 里 `tools.bash` 是 `false` | 没找到 Git Bash。装 Git for Windows（勾默认的「Git from the command line」），然后**重开窗口**再启动，PATH 才会刷新 |
 | 想指定用哪份 bash | 启动前设环境变量 `CAPY_BASH=D:\Git\bin\bash.exe` |
 | 它说「这台机器跑不了命令」 | 同上；另外确认 `capy-device` 那个小窗口还在跑 |
@@ -332,7 +353,7 @@ node tools/sim-client.mjs "用 bash 执行 ls /d 看有哪些目录，再用一�
 
 - **不要同时开 Capy 桌面客户端和 `capy-device`**：两者共用同一个设备身份，服务端只允许一条隧道，会互相顶下线（`4002 displaced`），一直抖。要么关客户端，要么 `node login.js enroll` 注册独立设备。
 - 这是**本机自用**工具。默认不要改成对外监听（`0.0.0.0`）。真要给别人用，开 `execMode: client`（命令在对方机器上跑）并设好 `localKey` —— 额度消耗的仍然是你自己的账号。
-- `data/auth.json` 和 `data/device.json` 等于你的账号凭据，**不要提交到 Git、不要发给别人**。项目已在 `.gitignore` 里排除 `data/` 和 `config.json`。
+- `data/auth.json`、`data/device.json` 和 `data/browser-profile/` 都等于你的账号凭据（最后一个是登着 capy.ai 的浏览器配置），**不要提交到 Git、不要发给别人**。项目已在 `.gitignore` 里排除 `data/` 和 `config.json`。
 - 它依赖 Capy 的内部接口，对方升级后可能需要更新一次配置（模型列表）。
 - 不是官方产品，不提供任何稳定性保证。
 
@@ -354,10 +375,10 @@ node tools/sim-client.mjs "用 bash 执行 ls /d 看有哪些目录，再用一�
 | --- | --- |
 | `start.bat` | 一键启动（账号检查 → 设备端 + 接口服务） |
 | `start.js` | 启动前的账号检查与登录菜单 |
-| `login.js` | 登录、绑定设备、查看状态 |
+| `login.js` | 开浏览器 → 抓 cookie → 换会话；设备绑定、状态查询 |
 | `server.js` | OpenAI 兼容接口 |
 | `device-worker.js` | 设备执行端 |
-| `lib/auth.js` | 登录态与设备身份的本地管理 |
+| `lib/auth.js` | cookie 换 JWT、JWT 刷新、设备身份与本地凭据落盘 |
 | `lib/tunnel.js` | 设备通道 |
 | `lib/device.js` | 本机命令与文件操作 |
 | `lib/gitvm.js` | 云端问「工作区 git 状态」时的应答 |
@@ -370,6 +391,7 @@ node tools/sim-client.mjs "用 bash 执行 ls /d 看有哪些目录，再用一�
 | `config.example.json` | 配置模板（复制成 `config.json` 后改；`config.json` 不进 Git） |
 | `models.json` | 模型目录快照 |
 | `data/` | 本地凭据（自动生成，不要外传） |
+| `data/browser-profile/` | 登录用的独立浏览器配置，里面存着 capy.ai 的登录态（同样不要外传） |
 | `data/logs/` | 设备端运行日志（按天一个文件） |
 
 ---
@@ -378,11 +400,11 @@ node tools/sim-client.mjs "用 bash 执行 ls /d 看有哪些目录，再用一�
 
 ```bash
 npm install          # 只有一个测试用依赖（ws）
-npm test             # 工具映射层 44 项 + 隧道协议 22 项，都不需要联网、不碰你的账号
+npm test             # 工具映射 44 项 + 登录层 13 项 + 隧道协议 22 项，都不需要联网、不碰你的账号
 ```
 
 - 测试全部跑在本地假网关/纯函数上，不会消耗额度，也不会执行真实命令。
-- 改了 `lib/oaitools.js` 就跑 `npm run test:tools`，改了 `lib/tunnel.js` 就跑 `npm run test:tunnel`。
+- 改了 `lib/oaitools.js` 就跑 `npm run test:tools`，改了 `lib/tunnel.js` 就跑 `npm run test:tunnel`，改了登录/cookie 相关就跑 `npm run test:login`。
 - 提交前请确认 `git status` 里没有 `data/`、`config.json`、`*.log`。
 - 详细约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
