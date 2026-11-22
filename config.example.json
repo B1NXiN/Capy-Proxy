@@ -1,0 +1,14 @@
+{
+  "port": 8787,
+  "host": "127.0.0.1",
+  "localKey": "",
+  "defaultModel": "particle/particle-1",
+  "timeoutMs": 180000,
+  "archive": true,
+  "showTools": false,
+  "capabilityHint": true,
+  "strictModel": true,
+  "preferAdsFree": true,
+  "workspaceRoot": "",
+  "execMode": "local"
+}

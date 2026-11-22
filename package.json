@@ -1,0 +1,46 @@
+{
+  "name": "capy-relay",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "把 Capy 账号变成一个标准的 OpenAI 兼容端点，工具调用交给调用方在自己的电脑上执行",
+  "main": "server.js",
+  "license": "MIT",
+  "keywords": [
+    "openai",
+    "openai-compatible",
+    "function-calling",
+    "tool-calls",
+    "llm",
+    "local-first",
+    "relay",
+    "capy"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "server.js",
+    "device-worker.js",
+    "start.js",
+    "login.js",
+    "lib/",
+    "tools/",
+    "models.json",
+    "config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node server.js",
+    "worker": "node device-worker.js",
+    "login": "node login.js browser",
+    "status": "node login.js status",
+    "models": "node tools/extract-models.cjs",
+    "test:tunnel": "node tools/test-tunnel.mjs",
+    "test:tools": "node tools/test-tools.mjs",
+    "test": "node tools/test-tools.mjs && node tools/test-tunnel.mjs"
+  },
+  "devDependencies": {
+    "ws": "^8.23.0"
+  }
+}

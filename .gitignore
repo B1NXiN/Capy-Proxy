@@ -1,0 +1,23 @@
+# ---- 凭据与本地状态（敏感，绝不提交）----
+data/
+auth.json
+device.json
+config.json
+.env
+.env.*
+
+# ---- 依赖与构建产物 ----
+node_modules/
+dist/
+*.zip
+*.7z
+*.tgz
+
+# ---- 日志与临时文件 ----
+*.log
+logs/
+tmp/
+.tmp/
+.DS_Store
+Thumbs.db
+*.swp
