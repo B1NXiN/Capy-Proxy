@@ -2,20 +2,15 @@
 
 把你自己的 **Capy 账号**变成一个标准的 OpenAI 接口，供 ChatBox、Cherry Studio、Continue 等任何支持 OpenAI 协议的 AI 客户端使用。
 
-它不只是转发对话：**任务真的在你电脑上执行** —— 查磁盘、跑命令、读写文件，都由本机完成。
-
 `MIT` · `Node.js >= 20` · `零运行依赖` · 单机服务，默认只听 `127.0.0.1`
-
-> 先说清楚：它用的是 Capy 客户端的内部接口，不是公开 API，**有账号被限制的风险**，详见文末「关于风险」。
 
 ---
 
 ## 它能做什么
 
 - **在其他 AI 客户端里用 Capy**：只要那个客户端支持「自定义 OpenAI 兼容地址」，就能接上。
-- **真正操作你的电脑**：让它看磁盘剩余空间、统计目录文件数、执行 PowerShell 命令，都是在本机真实跑出来的结果。
 - **不用一直开着 Capy 客户端**：一次登录、一次绑定设备，之后只跑本项目的两个进程即可。
-- **本机私有服务**：默认只监听 `127.0.0.1`，外部访问不到。
+- **本机私有服务**：默认只监听 `127.0.0.1`。
 
 ## 它适合谁
 
@@ -366,33 +361,6 @@ node tools/sim-client.mjs "用 bash 执行 ls /d 看有哪些目录，再用一�
 - 别拿它做对外服务、别多账号轮换刷额度。想稳定用，去买官方 API。
 
 出了这类问题本项目帮不上忙，也不承担后果。**自己想清楚再用。**
-
----
-
-## 目录说明
-
-| 文件 | 作用 |
-| --- | --- |
-| `start.bat` | 一键启动（账号检查 → 设备端 + 接口服务） |
-| `start.js` | 启动前的账号检查与登录菜单 |
-| `login.js` | 开浏览器 → 抓 cookie → 换会话；设备绑定、状态查询 |
-| `server.js` | OpenAI 兼容接口 |
-| `device-worker.js` | 设备执行端 |
-| `lib/auth.js` | cookie 换 JWT、JWT 刷新、设备身份与本地凭据落盘 |
-| `lib/tunnel.js` | 设备通道 |
-| `lib/device.js` | 本机命令与文件操作 |
-| `lib/gitvm.js` | 云端问「工作区 git 状态」时的应答 |
-| `lib/capy.js` | 创建线程、读取回复 |
-| `lib/clienttools.js` | 工具外抛中枢：挂起调用、配对回填 |
-| `lib/oaitools.js` | 工具映射层：Capy handler ↔ 标准函数工具（名字、参数、结果形状、上限） |
-| `tools/sim-client.mjs` | 自测用的模拟客户端 |
-| `tools/test-tunnel.mjs` | 协议一致性测试（起假网关） |
-| `tools/test-tools.mjs` | 工具映射层单测 |
-| `config.example.json` | 配置模板（复制成 `config.json` 后改；`config.json` 不进 Git） |
-| `models.json` | 模型目录快照 |
-| `data/` | 本地凭据（自动生成，不要外传） |
-| `data/browser-profile/` | 登录用的独立浏览器配置，里面存着 capy.ai 的登录态（同样不要外传） |
-| `data/logs/` | 设备端运行日志（按天一个文件） |
 
 ---
 
