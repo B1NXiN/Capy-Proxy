@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { session, createJam, getJam, followJam, followBreakpoint, archiveJam, listEvents, deviceInfo, eventCursor, emptyCursor, snapshotCursor, sendJamMessage } from './lib/capy.js';
 import { findGit, bashInfo } from './lib/device.js';
 import { createHub } from './lib/clienttools.js';
+import { openJamStream } from './lib/realtime.js';
 import {
   LIMITS,
   FORWARDABLE,
@@ -47,6 +48,8 @@ const defaults = {
   execMode: 'local',
   // 旧字段，等价于 execMode: 'client'
   clientTools: false,
+  // 流式输出走 realtime websocket 拿逐字增量；关掉就退回「轮询事件 + 攒完整段再吐」
+  realtime: true,
 };
 let cfg = { ...defaults };
 try {
@@ -94,6 +97,20 @@ function sendJson(res, status, payload) {
 }
 
 function oaiError(res, status, message, type = 'invalid_request_error') {
+  // 已经开了 SSE 流（比如建线程那一步花了 8 秒才发现出错）：头都发出去了，
+  // 改不了状态码，只能把错误写进流里，别让客户端一直等。
+  if (res.headersSent) {
+    try {
+      if (String(res.getHeader('content-type') || '').includes('event-stream')) {
+        res.write(`data: ${JSON.stringify({ error: { message, type, code: status, param: null } })}\n\n`);
+        res.write('data: [DONE]\n\n');
+      }
+    } catch {}
+    try {
+      res.end();
+    } catch {}
+    return;
+  }
   sendJson(res, status, { error: { message, type, code: null, param: null } });
 }
 
@@ -352,7 +369,38 @@ async function waitForToolCall(toolCallId, timeoutMs = 12000) {
   }
 }
 
-function sendToolCalls(res, { id, created, model, stream, text, calls, jamId, usage, elapsedMs, includeUsage = false }) {
+// 开一条 SSE 流并先把 role 发出去，后面才能真正边收边发。
+function openSse(res, { id, created, model }) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    'access-control-allow-origin': '*',
+  });
+  const chunk = (delta, finish = null) =>
+    res.write(
+      `data: ${JSON.stringify({
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta, finish_reason: finish }],
+      })}\n\n`,
+    );
+  chunk({ role: 'assistant', content: '' });
+  // 云端调度 + 模型起跑这一段可能十几秒没有任何正文；定期发注释帧保活，
+  // 免得中间的反代/客户端把连接判死。
+  const hb = setInterval(() => {
+    if (!res.writableEnded) res.write(': ping\n\n');
+  }, 15000);
+  hb.unref?.();
+  const stop = () => clearInterval(hb);
+  res.on('close', stop);
+  res.on('finish', stop);
+  return chunk;
+}
+
+function sendToolCalls(res, { id, created, model, stream, text, calls, jamId, usage, elapsedMs, includeUsage = false, sse = null }) {
   const usageObj = {
     prompt_tokens: usage?.inputTokens ?? 0,
     completion_tokens: usage?.outputTokens ?? 0,
@@ -375,23 +423,28 @@ function sendToolCalls(res, { id, created, model, stream, text, calls, jamId, us
       capy: { jamId, elapsedMs, mode: 'client-tools' },
     });
   }
-  res.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache, no-transform',
-    connection: 'keep-alive',
-    'access-control-allow-origin': '*',
-  });
-  const chunk = (delta, finish = null) =>
-    res.write(
-      `data: ${JSON.stringify({
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta, finish_reason: finish }],
-      })}\n\n`,
-    );
-  chunk({ role: 'assistant', content: text || '' });
+  // 流已经由调用方开好（realtime 模式下正文可能已经边收边发了），这里只补剩下的部分
+  if (sse) {
+    if (text) sse({ content: text });
+    calls.forEach((call, index) => sse({ tool_calls: [{ index, ...call }] }));
+    sse({}, 'tool_calls');
+    if (includeUsage) {
+      res.write(
+        `data: ${JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [],
+          usage: usageObj,
+        })}\n\n`,
+      );
+    }
+    res.write('data: [DONE]\n\n');
+    return res.end();
+  }
+  const chunk = openSse(res, { id, created, model });
+  if (text) chunk({ content: text });
   calls.forEach((call, index) => chunk({ tool_calls: [{ index, ...call }] }));
   chunk({}, 'tool_calls');
   // 标准做法：最后单独发一个只有 usage 的 chunk（choices 为空数组）
@@ -442,7 +495,7 @@ function toClientCall(scope, { toolCallId, toolName, args }) {
   };
 }
 
-async function runToBreakpoint(res, { id, created, model, stream, body, jamId, cursor = null, nudge = null }) {
+async function runToBreakpoint(res, { id, created, model, stream, body, jamId, cursor = null, nudge = null, sse = null }) {
   const fallbackScope = {
     clientTools: parseClientTools(body?.tools),
     choice: parseToolChoice(body?.tool_choice),
@@ -458,6 +511,37 @@ async function runToBreakpoint(res, { id, created, model, stream, body, jamId, c
   let requiredTried = false;
   let result = null;
   let lastCalls = 0;
+
+  // 流式：先把 SSE 头开出来，正文交给 realtime 边收边发，别等整轮跑完再吐
+  let chunk = null;
+  let emitted = '';
+  let rt = null;
+  if (stream) {
+    chunk = sse || openSse(res, { id, created, model });
+    if (cfg.realtime !== false && !process.env.CAPY_NO_REALTIME) {
+      rt = openJamStream({
+        jamId,
+        onText: (t) => {
+          if (!t || res.writableEnded) return;
+          emitted += t;
+          chunk({ content: t });
+        },
+        onReasoning: (t) => {
+          if (!t || res.writableEnded) return;
+          chunk({ reasoning_content: t });
+        },
+        log: (...a) => log(...a),
+      });
+      res.on('close', () => rt?.close());
+      res.on('finish', () => rt?.close());
+    }
+  }
+  // 已经实时流过的正文不再重复发；实流没拿到才整段补
+  const remainder = (full) => {
+    if (!full) return '';
+    if (full.startsWith(emitted)) return full.slice(emitted.length);
+    return emitted ? '' : full;
+  };
 
   try {
     // 最多转三圈：唤醒一次、required 催一次、指定函数空转一次
@@ -547,12 +631,13 @@ async function runToBreakpoint(res, { id, created, model, stream, body, jamId, c
         created,
         model,
         stream,
-        text: result.textSoFar,
+        text: remainder(result.textSoFar),
         calls: emitted,
         jamId,
         usage: result.usage,
         elapsedMs: result.elapsedMs,
         includeUsage,
+        sse: chunk,
       });
     }
   } catch (err) {
@@ -606,23 +691,8 @@ async function runToBreakpoint(res, { id, created, model, stream, body, jamId, c
       capy: { jamId, servedModel: result?.servedModel, mode: 'client-tools', elapsedMs: result?.elapsedMs },
     });
   }
-  res.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache, no-transform',
-    connection: 'keep-alive',
-    'access-control-allow-origin': '*',
-  });
-  const chunk = (delta, finish = null) =>
-    res.write(
-      `data: ${JSON.stringify({
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta, finish_reason: finish }],
-      })}\n\n`,
-    );
-  chunk({ role: 'assistant', content });
+  const tail = remainder(content);
+  if (tail) chunk({ content: tail });
   chunk({}, 'stop');
   if (includeUsage) {
     res.write(
@@ -723,10 +793,10 @@ async function handleChatClientTools(req, res, body, ctx) {
         log('唤醒失败', jamId, '|', err.message);
         return null;
       });
-      if (resumed) return runToBreakpoint(res, { ...ctx, body, jamId, cursor: resumed, nudge: { ...nudge, sent: true } });
+      if (resumed) return runToBreakpoint(res, { ...ctx, body, jamId, cursor: resumed, nudge: { ...nudge, sent: true }, sse: ctx.sse });
     }
 
-    return runToBreakpoint(res, { ...ctx, body, jamId, cursor, nudge });
+    return runToBreakpoint(res, { ...ctx, body, jamId, cursor, nudge, sse: ctx.sse });
   }
 
   const unknownTool = msgs.find((m) => m && m.role === 'tool' && m.tool_call_id && !hub.find(m.tool_call_id));
@@ -779,6 +849,10 @@ async function handleChat(req, res) {
   const showTools = pickShowTools(req, body);
   if (aliasOf) log('model alias', aliasOf, '->', model);
 
+  // 先把流开出来。建线程要等云端调度（实测 5~8 秒），客户端这段时间至少能看到
+  // 连接已建立 + role 帧，而不是盯着空白等一大坨。
+  const sse = stream ? openSse(res, { id, created, model }) : null;
+
   // 外抛模式：工具交给调用方执行。请求头 x-capy-exec 可覆盖配置，方便同一份服务里区分自己和别人。
   const execHeader = String(req.headers['x-capy-exec'] || '').toLowerCase();
   const configuredClientTools = cfg.execMode === 'client' || cfg.clientTools === true;
@@ -787,7 +861,7 @@ async function handleChat(req, res) {
   if (wantClientTools) {
     const names = (Array.isArray(body.tools) ? body.tools : []).map((t) => t?.function?.name).filter(Boolean);
     log('client-tools | model', model, '| client tools:', names.join(',') || 'none');
-    return handleChatClientTools(req, res, body, { id, created, model, stream });
+    return handleChatClientTools(req, res, body, { id, created, model, stream, sse });
   }
 
   let prompt;
@@ -849,33 +923,40 @@ async function handleChat(req, res) {
     }
   }
 
-  // ---- 流式 ----
-  res.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache, no-transform',
-    connection: 'keep-alive',
-    'access-control-allow-origin': '*',
-  });
+  // ---- 流式 ----（头已经开好了，这里直接发增量）
+  const sendChunk = sse;
 
-  const sendChunk = (delta, finish = null) => {
-    res.write(
-      `data: ${JSON.stringify({
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta, finish_reason: finish }],
-      })}\n\n`,
-    );
-  };
-
-  sendChunk({ role: 'assistant', content: '' });
-
-  const heartbeat = setInterval(() => res.write(': ping\n\n'), 15000);
   let closed = false;
   req.on('close', () => {
     closed = true;
   });
+
+  // 已经吐给客户端的正文。realtime 和兜底轮询都按这个对齐，避免同一段发两遍。
+  let emitted = '';
+  const emitText = (text) => {
+    if (!text || closed) return;
+    emitted += text;
+    sendChunk({ content: text });
+  };
+  const emitReasoning = (text) => {
+    if (!text || closed) return;
+    sendChunk({ reasoning_content: text });
+  };
+
+  // 逐字增量走 realtime；拿不到就靠下面的 followJam 轮询兜底
+  const useRealtime = cfg.realtime !== false && !process.env.CAPY_NO_REALTIME;
+  const rt = useRealtime
+    ? openJamStream({
+        jamId,
+        onText: emitText,
+        onReasoning: emitReasoning,
+        onTool: (info) => {
+          if (info?.phase === 'turn-start') log('stream', jamId, '| realtime 回合开始');
+        },
+        shouldStop: () => closed,
+        log: (...a) => log(...a),
+      })
+    : null;
 
   try {
     const result = await followJam({
@@ -883,7 +964,14 @@ async function handleChat(req, res) {
       timeoutMs: cfg.timeoutMs,
       shouldStop: () => closed,
       expectModel: cfg.strictModel ? model : null,
-      onDelta: (delta) => sendChunk({ content: delta }),
+      // 轮询给的是「累计全文」：只补 realtime 还没吐出来的尾巴
+      onDelta: (_delta, combined) => {
+        if (typeof combined !== 'string' || !combined) return;
+        if (combined.startsWith(emitted)) return emitText(combined.slice(emitted.length));
+        // 前缀对不上（通常是首尾空白差异）：只在还没吐过任何正文时整段补发
+        if (!emitted) return emitText(combined);
+        log('stream', jamId, '| realtime 与轮询文本不一致，跳过补偿', emitted.length, combined.length);
+      },
     });
     if (result.error && !result.text) {
       sendChunk({ content: `\n\n[上游错误] ${result.error.message}` });
@@ -901,7 +989,7 @@ async function handleChat(req, res) {
     sendChunk({}, 'stop');
     res.write('data: [DONE]\n\n');
   } finally {
-    clearInterval(heartbeat);
+    rt?.close();
     res.end();
     if (cfg.archive) archiveJam(jamId).catch(() => {});
   }

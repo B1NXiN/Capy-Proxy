@@ -10,5 +10,6 @@
   "strictModel": true,
   "preferAdsFree": true,
   "workspaceRoot": "",
-  "execMode": "local"
+  "execMode": "local",
+  "realtime": true
 }
