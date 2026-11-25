@@ -111,16 +111,21 @@ async function ensureDevice(orgId) {
     return true;
   }
 
-  if (usable && !sameOrg) warn('已有设备身份属于另一个组织（换过账号？），重新读取…');
-  else warn('这台机器还没有设备身份，尝试从 Capy 客户端读取…');
+  if (usable && !sameOrg) warn('已有设备身份属于另一个组织（换过账号？），重新注册…');
+  else warn('这台机器还没有设备身份，用当前登录态直接注册一台…');
 
-  const code = await runNode(['login.js', 'adopt']);
+  // 首选：登录态自己注册，不需要 Capy 客户端（arch 枚举要用 x86_64，见 lib/auth.js）
+  let code = await runNode(['login.js', 'enroll']);
   if (code === 0) return true;
 
-  bad('没有可接管的设备身份。');
+  warn('自己注册没成功，改为尝试接管本机客户端已注册的设备…');
+  code = await runNode(['login.js', 'adopt']);
+  if (code === 0) return true;
+
+  bad('这台机器拿不到设备身份。');
   say('');
-  say('   Capy 的设备注册接口不对外开放，这台电脑的身份只能从一次客户端登录里取得。');
-  say('   做法：装 Capy 客户端 → 登录一次 → 关掉 → 再运行本脚本。之后客户端可以永久不再启动。');
+  say('   先确认登录态有效： node login.js status');
+  say('   仍然不行就重登一次： node login.js browser --fresh');
   return false;
 }
 

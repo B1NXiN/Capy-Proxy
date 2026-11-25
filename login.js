@@ -106,6 +106,8 @@ async function pageTarget(port) {
 }
 
 // 从浏览器里把 Clerk 的 cookie 捞出来
+// 注意：__client 在“打开登录页”那一下就种下了（匿名追踪用），不代表已登录。
+// 真正登录成功的标志是 __session，或 __client_uat 从 "0" 变成时间戳。
 async function readCookies(port) {
   const page = await pageTarget(port);
   if (!page) return null;
@@ -114,7 +116,10 @@ async function readCookies(port) {
   const client = cookies.find((c) => c.name === '__client' && /(^|\.)clerk\.capy\.ai$/.test(c.domain) && c.value);
   if (!client) return null;
   const uat = cookies.find((c) => c.name === '__client_uat' && /(^|\.)capy\.ai$/.test(c.domain) && c.value);
-  return { client: client.value, uat: uat?.value || null };
+  const session = cookies.find((c) => c.name === '__session' && /(^|\.)capy\.ai$/.test(c.domain) && c.value);
+  const uatValue = uat?.value || null;
+  const signedIn = Boolean(session?.value) || Boolean(uatValue && uatValue !== '0');
+  return { client: client.value, uat: uatValue, signedIn };
 }
 
 async function closeBrowser(port) {
@@ -169,19 +174,43 @@ function launchBrowser(port) {
   );
 }
 
+// 等到“真的登录成功”为止：光是看到 cookie 不算，还要能换到 token
 async function waitForCookies(port, child) {
   const started = Date.now();
   let lastNote = 0;
   let deadAt = 0;
+  let lastErr = null;
+  let firstFailAt = 0;
+  let warnedStale = false;
   child?.once('exit', () => {
     deadAt = Date.now();
   });
 
   while (Date.now() - started < WAIT_MS) {
+    let got = null;
     try {
-      const got = await readCookies(port);
-      if (got) return got;
+      got = await readCookies(port);
     } catch {}
+
+    // cookie 出现了只说明“页面种了匿名 cookie”，还得确认会话真的有效
+    if (got?.signedIn) {
+      try {
+        const result = await loginWithCookies({ __client: got.client, __client_uat: got.uat }, { via: 'browser' });
+        return { cookies: got, result };
+      } catch (e) {
+        if (e.code !== 'no_active_session' && e.code !== 'no_jwt') throw e;
+        // cookie 还没同步到 Clerk 后端，继续等，别急着关浏览器
+        lastErr = e;
+        if (!firstFailAt) firstFailAt = Date.now();
+        // 有旧登录痕迹但换不到 token：提示一句，但不打断——人可能正在输入密码
+        if (!warnedStale && Date.now() - firstFailAt > 20000) {
+          warnedStale = true;
+          process.stdout.write(process.stdout.isTTY ? '\x1b[2K\r' : '');
+          console.log('  （浏览器里有份旧的登录 cookie 已失效，重新登一次就会覆盖它；一直卡住就用 --fresh）');
+        }
+      }
+    }
+
     // 窗口被关掉就尽快失败；但如果只是这个配置目录被另一个窗口占着，
     // 那个窗口仍然可能持有登录态，所以再多等 3 秒
     if (deadAt && Date.now() - deadAt > 3000) {
@@ -190,18 +219,21 @@ async function waitForCookies(port, child) {
     if (Date.now() - lastNote > 5000) {
       lastNote = Date.now();
       const left = Math.round((WAIT_MS - (Date.now() - started)) / 1000);
-      if (process.stdout.isTTY) process.stdout.write(`\r  等待登录… 剩余 ${left}s   `);
+      if (process.stdout.isTTY) process.stdout.write(`\r  等待你在浏览器里登录… 剩余 ${left}s   `);
     }
     await sleep(1200);
   }
-  const err = new Error(`等待登录超时（${Math.round(WAIT_MS / 1000)} 秒）`);
+  const err = new Error(
+    lastErr
+      ? `等待登录超时（${Math.round(WAIT_MS / 1000)} 秒）：cookie 拿到了但会话没生效，${lastErr.message}`
+      : `等待登录超时（${Math.round(WAIT_MS / 1000)} 秒）：浏览器里看起来还没完成登录`,
+  );
   err.code = 'login_timeout';
   throw err;
 }
 
 // ---------- 拿到 cookie 之后：换会话、落盘、报状态 ----------
-async function finish(cookies, via) {
-  const r = await loginWithCookies(cookies, { via });
+function announce(r) {
   console.log('✓ 登录成功：' + (r.email || r.userId || '（未知账号）'));
   if (r.orgId) console.log('  组织 ID：' + r.orgId);
 
@@ -216,6 +248,10 @@ async function finish(cookies, via) {
   console.log('');
   console.log('下一步： .\\start.bat');
   return 0;
+}
+
+async function finish(cookies, via) {
+  return announce(await loginWithCookies(cookies, { via }));
 }
 
 // ---------- 方式一：开浏览器，你自己登 ----------
@@ -240,19 +276,17 @@ async function browserLogin({ fresh = false } = {}) {
   console.log('  登进 Capy 主界面后这里会自动继续，不用回来敲任何东西。');
   console.log('');
 
-  let got;
+  let hit;
   try {
-    got = await waitForCookies(port, child);
+    hit = await waitForCookies(port, child);
   } catch (e) {
     await shutdown(child, port);
     throw e;
   }
   process.stdout.write(process.stdout.isTTY ? '\x1b[2K\r' : '');
-  console.log('✓ 已抓到登录 cookie');
-
-  // 先关浏览器再换 token：避免它在后台轮换 cookie，导致手上这份失效
+  // 会话已经验证过（能换到 token），这时候再关浏览器，避免它在后台继续轮换 cookie
   await shutdown(child, port);
-  return finish({ __client: got.client, __client_uat: got.uat }, 'browser');
+  return announce(hit.result);
 }
 
 // ---------- 方式二：直接粘 cookie ----------
@@ -285,6 +319,9 @@ async function attachLogin(portArg) {
     throw new Error(`连不上 ${port} 端口的浏览器：${e.message}`);
   }
   if (!got) throw new Error('这个浏览器里还没有 Capy 登录态，请先在窗口里登录');
+  if (!got.signedIn) {
+    throw new Error('这个浏览器只种了匿名 cookie（__client），登录还没完成，请在窗口里把账号登进去');
+  }
   console.log('✓ 已从浏览器读到登录 cookie');
   await closeBrowser(port);
   return finish({ __client: got.client, __client_uat: got.uat }, 'attach');
@@ -338,8 +375,8 @@ function help() {
   console.log('  cookie "<串>"     粘贴 DevTools 里复制的 cookie');
   console.log('  attach [端口]     从一个已经开着调试端口的浏览器里读（默认 9444）');
   console.log('  status            看登录与设备状态');
-  console.log('  adopt             接管桌面客户端的设备身份');
-  console.log('  enroll [--name]   注册一台新设备');
+  console.log('  enroll [--name]   用登录态注册一台新设备（不需要客户端）');
+  console.log('  adopt             接管桌面客户端残留的旧设备身份（一般不需要）');
   console.log('  logout            清掉本地登录态（设备信息保留）');
 }
 
@@ -404,9 +441,14 @@ main()
     console.error('');
     console.error('错误：' + err.message);
     if (err.code) console.error('代码：' + err.code);
+    if (err.code === 'no_credentials') {
+      console.error('');
+      console.error('本机没有可接管的客户端设备身份，直接用登录态注册一台： node login.js enroll');
+    }
     if (err.code === 'no_active_session' || err.code === 'no_client_cookie') {
       console.error('');
-      console.error('多半是浏览器里存着上一次的旧登录。清掉再来： node login.js browser --fresh');
+      console.error('浏览器里还没真正登进去（只看到匿名 cookie 也算没登）。');
+      console.error('重来一次： node login.js browser    旧登录态有干扰就加 --fresh');
     }
     process.exit(1);
   });

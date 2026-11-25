@@ -9,7 +9,7 @@
 ## 它能做什么
 
 - **在其他 AI 客户端里用 Capy**：只要那个客户端支持「自定义 OpenAI 兼容地址」，就能接上。
-- **不用一直开着 Capy 客户端**：一次登录、一次绑定设备，之后只跑本项目的两个进程即可。
+- **完全不需要 Capy 客户端**：登录一次，用自己的账号直接注册一台设备，之后只跑本项目的两个进程。
 - **本机私有服务**：默认只监听 `127.0.0.1`。
 
 ## 它适合谁
@@ -36,7 +36,7 @@
 | 一台已绑定为执行端的机器 | 见下面的「第一次启动」；每天使用不需要 Capy 桌面客户端 |
 | Git for Windows | 要让它执行命令就需要。装官方版即可（<https://git-scm.com/download/win>），程序会自动找：先看标准安装目录，再看 `PATH` 里的 git；也可以用环境变量 `CAPY_BASH` 手动指定 bash 路径 |
 
-> 说明：Capy 的设备注册接口不对外开放，所以「这台电脑」的设备身份需要从一次客户端登录中取一次。绑定完成后设备身份保存在 `data/device.json`，之后客户端可以永久不再启动，也可以直接把该文件复制到另一台机器使用。
+> 说明：设备身份由本项目自己注册（`POST /devices/enroll`，见 `lib/auth.js`），**不需要安装或运行 Capy 桌面客户端**。设备身份保存在 `data/device.json`，也可以直接把这个文件复制到另一台机器使用。
 
 ---
 
@@ -93,7 +93,7 @@ cd capy-relay
 
 保持窗口开着；关掉窗口就等于停止服务。
 
-> 设备身份只能取一次：Capy 的设备注册接口不对外开放，所以「这台电脑」的身份需要从一次客户端登录里取。如果脚本提示「没有可接管的设备身份」，装一次 Capy 客户端、登录一次、关掉，再双击 `start.bat` 就行。**之后客户端可以永久不再启动。**
+> 设备身份会自动注册：用你的登录态调一次 `POST /devices/enroll`，把 `deviceId` + `capyd_…` 令牌存进 `data/device.json`。**全程不需要 Capy 桌面客户端**。想换一台新设备身份就 `node login.js enroll`，想接管本机客户端残留的旧身份才用 `node login.js adopt`。
 >
 > 登录态保存在 `data/auth.json`，长期有效，过期了下次启动会自动问你要不要重新登录。
 
@@ -287,7 +287,8 @@ node tools/sim-client.mjs "用 bash 执行 ls /d 看有哪些目录，再用一�
 | `node login.js cookie "…"` | 从你自己的浏览器粘 `__client` / `__client_uat` |
 | `node login.js attach [端口]` | 接管一个已开调试端口的浏览器（默认 9444） |
 | `node login.js status` | 看登录是否还有效、设备是谁 |
-| `node login.js adopt` | 重新绑定本机设备身份 |
+| `node login.js enroll` | 用登录态注册一台新设备（不需要客户端） |
+| `node login.js adopt` | 接管本机客户端残留的旧设备身份（可选） |
 | `node login.js logout` | 清除本机登录态（设备绑定保留） |
 | `node device-worker.js` | 单独启动设备执行端 |
 | `node server.js` | 单独启动接口服务 |
@@ -324,7 +325,7 @@ node tools/sim-client.mjs "用 bash 执行 ls /d 看有哪些目录，再用一�
 | --- | --- |
 | 启动时问「请选择」 | 正常，还没登录过；选 1 登录一次即可 |
 | `Not signed in yet` | 先跑 `node login.js` 完成登录 |
-| `已登录但还没有注册执行设备` | 跑 `node login.js adopt` |
+| `已登录但还没有注册执行设备` | 跑 `node login.js enroll` |
 | `本地登录会话已过期` | 重新跑一次 `start.bat login` |
 | 登录窗口打开后一直显示「等待登录…」 | 确认已经在网页里登进 Capy 主界面（不是停在登录页），也不要中途关掉窗口 |
 | 提示 `cookie 里的会话已经失效` | 浏览器里存着旧登录；`node login.js browser --fresh` 清掉重登 |
